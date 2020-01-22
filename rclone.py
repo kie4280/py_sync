@@ -1,30 +1,43 @@
 import subprocess
 import re
 import json
-import os
 import atexit
-import time
+import os
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import watchdog.events as Events
+import asyncio
+import hashlib
+import concurrent.futures.thread
+import concurrent.futures
+import datetime
 
-
+from pathlib import *
 
 class FileEventHandler(FileSystemEventHandler):
 
     def __init__(self):
         super().__init__()
-        self.__is_modifying__ = False
-        self.__modified_list__ = []
+        self.monitoring = False
+        self.__modified_files__:set = set()
     
     def getModified(self):
-        return self.__modified_list__
+        return self.__modified_files__
+    def clearModified(self):
+        self.__modified_files__.clear()
+    def togglestate(self, monitor:bool = False):
+        self.monitoring = monitor
 
     def on_modified(self, event):
-
-        print(event, event.src_path)
-        if(type(event) == Events.DirModifiedEvent):
-            print("dir modified")
+        if(self.monitoring):
+            print(event, event.src_path)
+            if(type(event) == Events.DirModifiedEvent):
+                print("dir modified")
+                self.__modified_files__.add(Path(event.src_path))
+            else if(type(event) == Events.FileModifiedEvent):
+                print("file modified")
+                self.__modified_files__.add(Path(event.src_path).parent)
+                
         return super().on_modified(event)    
 
 
@@ -33,13 +46,13 @@ class Rclone:
 
     # some static variables
 
-    __is_syncing__ = False
+    __is_syncing__:bool = False
     
     
     def __init__(self, folder):
         super().__init__()
         self.folder:str = folder
-        self.STORAGE_NAMES:list = ["nctu", "MyProject", "test", "Gsuite"]
+        self.STORAGE_NAMES:list = ["test"]
         self.GLOBAL_FLAGS:list = ["--use-json-log",
          "--cache-dir", "{}/.cache".format(self.folder),
          "--cache-chunk-path", "{}/.cache-chunk".format(self.folder),
@@ -48,19 +61,25 @@ class Rclone:
          ]
         self.BACKEND_FLAGS:list = ["--recursive"]
 
-        self.file_event_watcher= FileEventHandler()
+        self.file_event_handler= FileEventHandler()
         self.fileObserver = Observer()
-        self.fileObserver.schedule(self.file_event_watcher, folder, recursive=True)
+        self.fileObserver.schedule(self.file_event_handler, folder, recursive=True)
         self.fileObserver.start()
+        self.threadpoolExecutor = concurrent.futures.thread.ThreadPoolExecutor(max_workers=8)   
+        self.__is_hashing__ = False
+        
 
-        atexit.register(self.cleanup)
+
+        atexit.register(self.__cleanup__) # register cleanup
     
     
-    def cleanup(self):
+    def __cleanup__(self):
         self.fileObserver.stop()
         self.fileObserver.join()
+        self.__is_hashing__ = False
+        self.threadpoolExecutor.shutdown()
 
-    def check_install(self):
+    def __check_install__(self):
         try:
             if not os.path.exists(self.folder + "/.cache/"):
                 os.mkdir(self.folder + "/.cache/")
@@ -85,23 +104,77 @@ class Rclone:
             return 1
         else:
             return 0
-        pass
-    def check_changes(self):
 
-        pass
+    def __generate_hashsum__(self, path:Path):
+        '''Generates a checksum file for the files below 
+        this directory'''  
+
+        if not self.__is_hashing__: return
+        p = Path(path)
+        files = [x for x in p.iterdir() if x.is_file()]
+        folders = [x for x in p.iterdir() if x.is_dir()] 
+        for folds in folders:
+            self.threadpoolExecutor.submit(self.__generate_hashsum__, folds)
+        
+        jj = dict()
+        jj["mtime"] = str(datetime.datetime.now())
+        for fs in files:
+            if fs.name == ".hashsum": continue
+            m = hashlib.md5()
+            try:
+                with open(fs.resolve(), "rb") as f:            
+                    for chunk in iter(lambda: f.read(4096), b""):
+                        m.update(chunk)
+            except IOError as e:
+                print(e)
+                pass
+            h = m.hexdigest()
+            jj[fs.name] = h
+            print(fs.name, h)
+        
+        if len(jj) > 1:
+            try:
+                with open(path.joinpath(".hashsum"), "w") as f:            
+                    json.dump(jj, f)
+            except IOError as e:
+                print("write hashsum error")
+                print(e)
+
+                
+            
+
+        
+
+        
+    async def __check_changes__(self):
+        
+        self.__is_hashing__ = True
+        self.__generate_hashsum__(Path(self.folder))
+        
+        await asyncio.sleep(6)
+
 
     def start(self):
-        try:
-            while True:
-                self.__sync__()
-                time.sleep(60)
-        except KeyboardInterrupt:
-            pass
+        '''This is the program entry "start" '''
 
-    def __sync__(self):
-        if not self.check_install():
+        if not self.__check_install__():
             print("must install first")
             exit(1)
+
+        while True:
+            
+            try:
+                asyncio.run(self.__check_changes__())
+                
+            except KeyboardInterrupt:
+                print("exit")                
+                exit(0)
+        
+
+    async def __sync__(self):
+        
+        self.__is_syncing__ = True
+        
         call_result = subprocess.run(["rclone", *self.GLOBAL_FLAGS, 
             "lsjson", "{0}:/test_rclone".format(self.STORAGE_NAMES[3])], capture_output=True, encoding="UTF-8")
 
@@ -116,19 +189,12 @@ class Rclone:
             print(j[0])
         else:
             print(call_result.stderr)
+        
 
-        # call_result = subprocess.run(["rclone", *self.GLOBAL_FLAGS, 
-        #     "check", "{0}:/test_rclone".format(self.STORAGE_NAMES[3]), "/media/kie/VM/VMfolder"], capture_output=True, encoding="UTF-8")
-        # num_diff_files = 0
-        # for diffs in str(call_result.stderr).split("\n"):
-        #     if len(diffs) != 0:
-        #         error = json.loads(diffs)
-        #         print(error)
-
-
+        self.__is_syncing__ = False
 
 
 if __name__ == "__main__":
-    r = Rclone("/media/kie/VM/VMfolder")
+    r = Rclone("/home/kie/test")
     r.start()    
 
