@@ -2,5 +2,5 @@
 - .cache-db/
 - .cache-chunk/
 - .logs/
-- **/.hashsum
+- .sync_ignore/
 
