@@ -1,4 +1,6 @@
 import asyncio
+import time
+import datetime
 
 async def df():
     print("hello")
@@ -12,9 +14,12 @@ def sync():
     print("print sync")
 
 async def main():
+
+    back = time.time()
     await asyncio.gather(da(), df())
     print("egg")
-
+    front = time.time()
+    print(front-back)
 asyncio.run(main())
 
 
