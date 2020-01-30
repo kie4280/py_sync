@@ -47,12 +47,13 @@ class DriveClient:
         self.terminate: bool = False
         self.threads: int = 1
         self.folderScanSleepTime: int = 2
-        self.fileScanSleepTime: int = 1
-        self.querySize: int = 50
+        self.fileScanSleepTime: int = 2
+        self.querySize: int = 100
         self.folderCount: int = 0
         self.fileWriteQueue: queue.Queue = queue.Queue(1000)
         self.folderWriteQueue: queue.Queue = queue.Queue(1000)
-        self.nextPageTokens: dict = dict()
+        self.folderPageTokens: dict = dict()
+        self.filePageTokens: dict = dict()
         self.idToFolder: dict = dict()
         self.searchFoldersQueue: queue.Queue = queue.Queue(10000)
         self.searchFileQueue: queue.Queue = queue.Queue(10000)
@@ -81,12 +82,13 @@ class DriveClient:
                 else:
                     t: str = q.get(block=True)
                     if t == None:
+                        q.task_done()
                         break
                     else:
                         if first:
                             first = False
                         else:
-                            f.write(", ")
+                            f.write(",")
                         f.write(t)
                         q.task_done()
             f.write("]")
@@ -176,6 +178,28 @@ class DriveClient:
 
         return result
 
+    def _onBatchFileReceived(self, id, response, exception):
+        if exception is not None:            
+            self.searchFileQueue.task_done()
+            raise BatchRequestError("exception encountered", exception)
+            pass
+        elif self.terminate == False:
+
+            results = response.get("files", [])
+            nextPage = response.get("nextPageToken", None)
+            if nextPage != None:
+                folder_str, _a = self.filePageTokens[id]
+                self.filePageTokens[id] = (folder_str, nextPage)
+                self.searchFileQueue.put(id, block=False)
+
+            elif nextPage == None and id in self.folderPageTokens:
+                self.filePageTokens.pop(id, "")
+
+            r: str = json.dumps(results, ensure_ascii=False)[1:-1]
+            if len(r) > 0:
+                self.fileWriteQueue.put(r)
+            self.searchFileQueue.task_done()
+
     def batchFile(self, trashed: bool = False, **kwargs):
 
         trash_str = "true" if trashed else "false"
@@ -186,33 +210,31 @@ class DriveClient:
             count: int = 0
             batch = service.new_batch_http_request()
             folders: list = list()
-            batch: int = 0
-            while batch < 100 and q.qsize() > 1000:
-                pass
+            count: int = 0
 
-            while q.qsize() > 0 and count < self.querySize:
-                folder: str = q.get(block=False)
-                folders.appemd(folder)
+            
+            while count < 10 and q.qsize() > 0:                    
+                
+                id: str = q.get(block=False)                   
+                folder_str, nextPageToken = self.filePageTokens[id]
+
+                query = "( {0} ) and trashed={1} and 'me' in owners and" \
+                    "mimeType!='application/vnd.google-apps.folder'".format(
+                        folder_str, trash_str)
+                l = service.files().list(
+                    pageSize=1000, fields=DriveClient.fields,
+                    q=query, spaces="drive", pageToken=nextPageToken
+                )
+                batch.add(request=l, callback=self._onBatchFileReceived,
+                        request_id=id)
                 count += 1
-
-            query = "{0} and trashed={1} and 'me' in owners and" \
-                "mimeType='application/vnd.google-apps.folder'".format(
-                    folder_str, trash_str)
-            l = service.files().list(
-                pageSize=1000, fields=DriveClient.fields,
-                q=query, spaces="drive", pageToken=self.nextPageTokens.get(id, None)
-            )
-            batch.add(request=l, callback=self.onBatchFolderReceived,
-                      request_id=id)
-
-            q.task_done()
-
+            
             batch.execute()
             time.sleep(self.fileScanSleepTime)
 
     def _onBatchFolderReceived(self, id, response, exception):
         if exception is not None:            
-
+            self.searchFoldersQueue.task_done()  # to check whether we've finished yet
             raise BatchRequestError("exception encountered", exception)
             pass
         elif self.terminate == False:
@@ -225,13 +247,14 @@ class DriveClient:
             print("pageToken", nextPage)
 
             if nextPage != None:
-                self.nextPageTokens[id] = nextPage
-
+                folder_str, _a = self.folderPageTokens[id]
+                self.folderPageTokens[id] = (folder_str, nextPage)
                 self.searchFoldersQueue.put(id, block=False)
-            elif nextPage == None and id in self.idToFolder:
-                self.nextPageTokens.pop(id, "")
-                self.idToFolder.pop(id, "")
 
+            elif nextPage == None and id in self.folderPageTokens:
+                self.folderPageTokens.pop(id, "")
+
+            
             queries: list = list()
 
             for f in results:
@@ -243,17 +266,22 @@ class DriveClient:
                     m = hashlib.md5(folder_str.encode("ascii"))
                     id = m.hexdigest()
                     self.searchFoldersQueue.put(id, block=False)
-                    self.idToFolder[id] = folder_str
+                    self.searchFileQueue.put(id, block=False)
+                    self.folderPageTokens[id] = (folder_str, None)
+                    self.filePageTokens[id] = (folder_str, None)
                     queries.clear()
-                self.searchFileQueue.put(f["id"])
+                
                 self.folderCount += 1
             if len(queries) > 0:
                 folder_str: str = " or ".join(queries)
                 m = hashlib.md5(folder_str.encode("ascii"))
                 id = m.hexdigest()
                 self.searchFoldersQueue.put(id, block=False)
-                self.idToFolder[id] = folder_str
+                self.searchFileQueue.put(id, block=False)
+                self.folderPageTokens[id] = (folder_str, None)
+                self.filePageTokens[id] = (folder_str, None)
                 queries.clear()
+            
 
             self.searchFoldersQueue.task_done()  # to check whether we've finished yet
             r: str = str(json.dumps(results, ensure_ascii=False))[1:-1]
@@ -273,7 +301,7 @@ class DriveClient:
 
             while q.qsize() > 0 and count < 10:
                 id: str = q.get(block=False)
-                folder_str: str = self.idToFolder[id]
+                folder_str, nextPageToken = self.folderPageTokens[id]
 
                 query = "( {0} ) and trashed={1} and 'me' in owners and" \
                     "mimeType='application/vnd.google-apps.folder'".format(
@@ -281,7 +309,7 @@ class DriveClient:
 
                 l = service.files().list(
                     pageSize=1000, fields=DriveClient.fields,
-                    q=query, spaces="drive", pageToken=self.nextPageTokens.get(id, None)
+                    q=query, spaces="drive", pageToken=nextPageToken
                 )
 
                 batch.add(request=l, callback=self._onBatchFolderReceived,
@@ -301,15 +329,17 @@ class DriveClient:
         folder_str: str = "'{0}' in parents".format(folder)
         m = hashlib.md5(folder_str.encode("ascii"))
         id: str = m.hexdigest()
-        self.idToFolder[id] = folder_str
-        self.searchFoldersQueue.put(id)
-        self.searchFileQueue.put(folder)
-        futures: list = list()
-        for i in range(self.threads):
-            threadname: str = "searchThread{}".format(i)
-            futures.append(self.threadPoolExecutor.submit(
-                self.batchFolder, folder=folder))
+        self.searchFoldersQueue.put(id, block=False)
+        self.searchFileQueue.put(id, block=False)
+        self.folderPageTokens[id] = (folder_str, None)
+        self.filePageTokens[id] = (folder_str, None)
+
+        self.threadPoolExecutor.submit(
+                self.batchFolder, folder=folder)
+        self.threadPoolExecutor.submit(
+                self.batchFile, folder=folder)
         self.searchFoldersQueue.join()
+        self.searchFileQueue.join()
 
     def upload(self, file):
         results = self.getService().files().list(
@@ -347,8 +377,8 @@ if __name__ == "__main__":
     back = time.time()
     d = DriveClient("/home/kie/test/.sync_ignore")
     d.authenticate()
-    d.listAll("1QHfx3xUyKMvzPxqrI1AbEXadPnZjFs4Z")
-    # d.listAll("root")
+    # d.listAll("1QHfx3xUyKMvzPxqrI1AbEXadPnZjFs4Z")
+    d.listAll("root")
     print(d.folderCount)
     front = time.time()
     print(front-back)
