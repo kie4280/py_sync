@@ -53,14 +53,22 @@ class DriveClient:
 
         self.threadnames: dict = dict()
         signal.signal(signal.SIGINT, self.__keyboardINT__)
+        signal.signal(signal.SIGTERM, self.__terminate__)
         atexit.register(self.__cleanup__)
+
+    def __terminate__(self, signal, frame):
+        self.__cleanup__()
 
     def __cleanup__(self):
         self.terminate = True
         self.fileWriteQueue.put(None, block=False)
         self.folderWriteQueue.put(None, block=False)
-        self.searchFoldersQueue.put(None, block=False)
+        
         self.threadPoolExecutor.shutdown(True)
+
+    def __keyboardINT__(self, signal, frame):
+        print("keyboard interrupt received")
+        self.__cleanup__()
 
     def writeToCache(self, q: queue.Queue, cache_file_name: str = "drive_cache"):
 
@@ -226,22 +234,26 @@ class DriveClient:
         while self.terminate == False:
             
 
-            if fq.qsize() > self.querySize or (sq.qsize() < 10 and fq.qsize() > 0):
+            if fq.qsize() > self.querySize or (sq.qsize() < 20 and fq.qsize() > 0):
                 queries: list = list()
                 for _ in range(self.querySize):
                     if fq.qsize() > 0:
-                        queries.append(fq.get(block=True))
-                        fq.task_done()
+                        try:
+                            queries.append(fq.get(block=False))
+                            fq.task_done()
+                        except queue.Empty as empty:
+                            pass
                     else: 
                         break
-                folder_str: str = " or ".join(queries)
-                m = hashlib.md5(folder_str.encode("ascii"))
-                id = m.hexdigest()
-                sq.put(id, block=False)
-                # self.searchFileQueue.put(id, block=False)
-                self.folderPageTokens[id] = (folder_str, None)
-                # self.filePageTokens[id] = (folder_str, None)
-                queries.clear()
+                if len(queries) > 0:
+                    folder_str: str = " or ".join(queries)
+                    m = hashlib.md5(folder_str.encode("ascii"))
+                    id = m.hexdigest()
+                    sq.put(id, block=False)
+                    # self.searchFileQueue.put(id, block=False)
+                    self.folderPageTokens[id] = (folder_str, None)
+                    # self.filePageTokens[id] = (folder_str, None)
+                    
             
             
             if sq.qsize() > 0:
@@ -263,6 +275,9 @@ class DriveClient:
                     if e.getCause() == RequestError.RATE_LIMIT_EXCEEDED:
                         time.sleep(3)
                         retry = True
+                        self.folderPageTokens[id] = (folder_str, nextPageToken)
+                        sq.put(id, block=False)
+                        
                 else:
                     
                     time.sleep(self.folderScanSleepTime)
@@ -320,10 +335,7 @@ class DriveClient:
     def download(self, fileID: str):
         pass
 
-    def __keyboardINT__(self, signal, frame):
-        print("keyboard interrupt received")
-        self.terminate = True
-
+    
 
 class FileStruct:
     def __init__(self):
@@ -337,11 +349,11 @@ if __name__ == "__main__":
     back = time.time()
     d = DriveClient("/home/kie/test/.sync_ignore")
     d.authenticate()
-    d.listAll("1QHfx3xUyKMvzPxqrI1AbEXadPnZjFs4Z")
-    # d.listAll("root")
+    # d.listAll("1QHfx3xUyKMvzPxqrI1AbEXadPnZjFs4Z")
+    d.listAll("root")
     print(d.folderCount)
     print(d.fileCount)
     front = time.time()
     print(front-back)
-    d.terminate = True
+    
     pass

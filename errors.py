@@ -10,7 +10,7 @@ class AuthenticateError(Exception):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-class RequestError(Exception):
+class RequestError(apiErrors.HttpError):
 
     RATE_LIMIT_EXCEEDED = "User Rate Limit Exceeded"
     BATCH_ERROR = "Batch Error"
