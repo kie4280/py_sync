@@ -16,6 +16,7 @@ import threading
 import concurrent.futures.process
 import hashlib
 from errors import *
+import googleapiclient.errors as apiErrors
 
 
 class DriveClient:
@@ -31,7 +32,7 @@ class DriveClient:
         self.creds = None
         self.cache_dir: str = cache_dir
         self.terminate: bool = False
-        self.threads: int = 4
+        self.threads: int = 16
         self.folderScanSleepTime: int = 0.5
         self.fileScanSleepTime: int = 0.5
         self.folderScanComplete: bool = False
@@ -49,7 +50,7 @@ class DriveClient:
         self.searchFoldersQueue: queue.Queue = queue.Queue(10000)
         self.searchFileQueue: queue.Queue = queue.Queue(10000)
         self.threadPoolExecutor = concurrent.futures.thread.ThreadPoolExecutor(
-            max_workers=8)
+            max_workers=16)
 
         self.threadnames: dict = dict()
         signal.signal(signal.SIGINT, self.__keyboardINT__)
@@ -65,6 +66,17 @@ class DriveClient:
         self.folderWriteQueue.put(None, block=False)
         
         self.threadPoolExecutor.shutdown(True)
+        try:
+            while 1:
+                self.searchFoldersQueue.task_done()
+        except ValueError:
+            pass
+        try:
+            while 1:
+                self.searchFileQueue.task_done()
+        except ValueError:
+            pass
+        print("clean up called")
 
     def __keyboardINT__(self, signal, frame):
         print("keyboard interrupt received")
@@ -192,6 +204,31 @@ class DriveClient:
                 time.sleep(self.fileScanSleepTime)
                 retry = False
 
+    def _generateFolderQuery(self):
+
+        sq = self.searchFoldersQueue
+        fq = self.folderQueries
+
+        if fq.qsize() > self.querySize or (sq.qsize() < 20 and fq.qsize() > 0):
+            queries: list = list()
+            for _ in range(self.querySize):
+                if fq.qsize() > 0:
+                    try:
+                        queries.append(fq.get(block=False))
+                        fq.task_done()
+                    except queue.Empty as empty:
+                        pass
+                else: 
+                    break
+            if len(queries) > 0:
+                folder_str: str = " or ".join(queries)
+                m = hashlib.md5(folder_str.encode("ascii"))
+                id = m.hexdigest()
+                sq.put(id, block=False)
+                # self.searchFileQueue.put(id, block=False)
+                self.folderPageTokens[id] = (folder_str, None)
+                # self.filePageTokens[id] = (folder_str, None)
+
     def _onFolderReceived(self, id, response):
         if self.terminate == False:
 
@@ -231,58 +268,49 @@ class DriveClient:
         service = self.getService()
         retry: bool = False
 
-        while self.terminate == False:
+        while self.terminate == False:      
             
-
-            if fq.qsize() > self.querySize or (sq.qsize() < 20 and fq.qsize() > 0):
-                queries: list = list()
-                for _ in range(self.querySize):
-                    if fq.qsize() > 0:
-                        try:
-                            queries.append(fq.get(block=False))
-                            fq.task_done()
-                        except queue.Empty as empty:
-                            pass
-                    else: 
-                        break
-                if len(queries) > 0:
-                    folder_str: str = " or ".join(queries)
-                    m = hashlib.md5(folder_str.encode("ascii"))
-                    id = m.hexdigest()
-                    sq.put(id, block=False)
-                    # self.searchFileQueue.put(id, block=False)
-                    self.folderPageTokens[id] = (folder_str, None)
-                    # self.filePageTokens[id] = (folder_str, None)
+            sq_size = sq.qsize()      
+            
+            try:
+                if sq_size > 0:  
+                    id: str = sq.get(block=False)
                     
-            
-            
-            if sq.qsize() > 0:
-                id: str = sq.get(block=True)
-                folder_str, nextPageToken = self.folderPageTokens[id]
-                query = "( {0} ) and trashed={1} and 'me' in owners and" \
-                    "mimeType='application/vnd.google-apps.folder'".format(
-                        folder_str, trash_str)
-                l = service.files().list(
-                    pageSize=1000, fields=DriveClient.fields,
-                    q=query, spaces="drive", pageToken=nextPageToken
-                )
-                
-
-                try:
+                    folder_str, nextPageToken = self.folderPageTokens[id]
+                    query = "( {0} ) and trashed={1} and 'me' in owners and" \
+                        "mimeType='application/vnd.google-apps.folder'".format(
+                            folder_str, trash_str)
+                    l = service.files().list(
+                        pageSize=1000, fields=DriveClient.fields,
+                        q=query, spaces="drive", pageToken=nextPageToken
+                    )
+                    
                     response = l.execute()
                     self._onFolderReceived(id, response)
-                except RequestError as e:
-                    if e.getCause() == RequestError.RATE_LIMIT_EXCEEDED:
+                self._generateFolderQuery()
+            except queue.Empty as empty:
+                
+                pass
+            except Exception as exc:
+                
+                print("request error")
+                if isinstance(exc, apiErrors.HttpError):
+                    cause = RequestError(exc).getCause()
+                    if cause == RequestError.RATE_LIMIT_EXCEEDED:
                         time.sleep(3)
                         retry = True
                         self.folderPageTokens[id] = (folder_str, nextPageToken)
                         sq.put(id, block=False)
-                        
+                
+                    sq.task_done()
                 else:
-                    
-                    time.sleep(self.folderScanSleepTime)
-                    retry = False
-                sq.task_done()
+                    raise
+            else:
+                if sq_size > 0:
+                    sq.task_done()
+                time.sleep(self.folderScanSleepTime)
+                retry = False
+                
         
         while sq.qsize() > 0:
             sq.get(block=False)
