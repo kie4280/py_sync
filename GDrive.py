@@ -2,6 +2,8 @@ from __future__ import print_function
 import pickle
 import os.path
 from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.http import MediaFileUpload
 
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
@@ -17,12 +19,16 @@ import concurrent.futures.process
 import hashlib
 from errors import *
 import googleapiclient.errors as apiErrors
+import io
+import pyrfc3339
+import pytz
+import datetime
 
 
 class DriveClient:
 
-    SCOPES = ['https://www.googleapis.com/auth/drive.readonly',
-          'https://www.googleapis.com/auth/drive.metadata.readonly'
+    SCOPES = ['https://www.googleapis.com/auth/drive',
+          'https://www.googleapis.com/auth/drive.metadata'
           ]
 
     fields = "nextPageToken, files(id, name, md5Checksum, mimeType, parents, modifiedTime)"
@@ -44,11 +50,12 @@ class DriveClient:
         self.folderWriteQueue: queue.Queue = queue.Queue(1000)
         self.folderQueries: queue.Queue = queue.Queue(10000)
         self.fileQueries: queue.Queue = queue.Queue(10000)
+        self.searchFoldersQueue: queue.Queue = queue.Queue(10000)
+        self.searchFileQueue: queue.Queue = queue.Queue(10000)
         self.folderPageTokens: dict = dict()
         self.filePageTokens: dict = dict()
         
-        self.searchFoldersQueue: queue.Queue = queue.Queue(10000)
-        self.searchFileQueue: queue.Queue = queue.Queue(10000)
+        
         self.threadPoolExecutor = concurrent.futures.thread.ThreadPoolExecutor(
             max_workers=16)
 
@@ -59,12 +66,10 @@ class DriveClient:
 
     def __terminate__(self, signal, frame):
         self.__cleanup__()
-
+    def stop(self):
+        self.__cleanup__()
     def __cleanup__(self):
-        self.terminate = True
-        self.fileWriteQueue.put(None, block=False)
-        self.folderWriteQueue.put(None, block=False)
-        
+        self.terminate = True        
         self.threadPoolExecutor.shutdown(True)
         try:
             while 1:
@@ -76,6 +81,7 @@ class DriveClient:
                 self.searchFileQueue.task_done()
         except ValueError:
             pass
+        
         print("clean up called")
 
     def __keyboardINT__(self, signal, frame):
@@ -116,10 +122,7 @@ class DriveClient:
         return service
 
     def authenticate(self, credentials: str = "credentials.json", tokens: str = "token.pickle"):
-        """Shows basic usage of the Drive v3 API.
-        Prints the names and ids of the first 10 files the user has access to.
-        """
-
+        
         # The file token.pickle stores the user's access and refresh tokens, and is
         # created automatically when the authorization flow completes for the first
         # time.
@@ -137,8 +140,6 @@ class DriveClient:
             # Save the credentials for the next run
             with open(tokens, 'wb') as token:
                 pickle.dump(self.creds, token)
-
-
 
     def _onFileReceived(self, id, response):
         if self.terminate == False:
@@ -192,8 +193,7 @@ class DriveClient:
                 self.filePageTokens[id] = (folder_str, None)
                 # self.filePageTokens[id] = (folder_str, None)
 
-
-    def listFiles(self, trashed: bool = False, **kwargs):
+    def _listFiles(self, trashed: bool = False, **kwargs):
 
         trash_str = "true" if trashed else "false"
         sq = self.searchFileQueue
@@ -252,7 +252,6 @@ class DriveClient:
         while fq.qsize() > 0:
             fq.get(block=False)
             fq.task_done()
-
         
     def _generateFolderQuery(self):
 
@@ -303,15 +302,17 @@ class DriveClient:
                 self.folderQueries.put(folder, block=False)  
                 self.fileQueries.put(folder, block=False)
                 self.folderCount += 1
-            
+                modifiedTime: str = f["modifiedTime"]
+                newTime:str = str(pyrfc3339.parse(modifiedTime)
+                .replace(tzinfo=None)) # modified time is always in UTC
+                f["modifiedTime"] = newTime
 
             
             r: str = str(json.dumps(results, ensure_ascii=False))[1:-1]
             if len(r) > 0:
                 self.folderWriteQueue.put(r, block=False)
         
-
-    def listFolders(self, trashed: bool = False, **kwargs):
+    def _listFolders(self, trashed: bool = False, **kwargs):
 
         trash_str = "true" if trashed else "false"
         sq = self.searchFoldersQueue
@@ -372,10 +373,13 @@ class DriveClient:
             fq.task_done()
 
     def listAll(self, folder: str = "root", trashed: bool = False, mimeType: str = "", **kwargs):
+        '''Args: folder: search under this directory, trashed: show trashed \n
+        return tuple (folderCount, fileCount)
+        '''
         self.threadPoolExecutor.submit(
-            self.writeToCache, self.fileWriteQueue, cache_file_name="drive_cache_files")
+            self.writeToCache, self.fileWriteQueue, cache_file_name="remote_cache_files")
         self.threadPoolExecutor.submit(
-            self.writeToCache, self.folderWriteQueue, cache_file_name="drive_cache_folder")
+            self.writeToCache, self.folderWriteQueue, cache_file_name="remote_cache_folders")
 
         folder_str: str = "'{0}' in parents".format(folder)
         m = hashlib.md5(folder_str.encode("ascii"))
@@ -386,35 +390,31 @@ class DriveClient:
         self.filePageTokens[id] = (folder_str, None)
         for i in range(self.threads):
             self.threadPoolExecutor.submit(
-                    self.listFolders, folder=folder)
+                    self._listFolders, folder=folder)
             self.threadPoolExecutor.submit(
-                    self.listFiles, folder=folder)
+                    self._listFiles, folder=folder)
         
         while self.terminate == False and (self.folderQueries.qsize() > 0 or self.searchFoldersQueue.qsize() > 0):
             time.sleep(1)
             self.searchFoldersQueue.join()
             self.searchFileQueue.join()
-        
-        # self.searchFileQueue.join()
+        self.terminate = True
+        return self.folderCount, self.fileCount
 
     def upload(self, file):
-        results = self.getService().files().list(
-            pageSize=1000, fields="nextPageToken, files(id, name, md5Checksum, mimeType)",
-            q="'root' in parents and trashed=false", spaces="drive"
-        ).execute()
-
-        items = results.get('files', [])
-
-        if not items:
-            print('No files found.')
-        else:
-            print('Files:')
-            for item in items:
-                print(u'{0} ({1}) md5:{2} mimeType:{3}'.format(item['name'], item['id'], item.get('md5Checksum', "None"),
-                                                               item["mimeType"]))
+        pass
 
     def download(self, fileID: str):
-        pass
+        service = self.getService()
+        
+        request = service.files().get_media(fileId=fileID)
+        fh = io.BytesIO()
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while done is False:
+            status, done = downloader.next_chunk()
+            print("Download {}.".format( int(status.progress() * 100)))
+
 
     
 
@@ -430,10 +430,11 @@ if __name__ == "__main__":
     back = time.time()
     d = DriveClient("/home/kie/test/.sync_ignore")
     d.authenticate()
-    # d.listAll("1QHfx3xUyKMvzPxqrI1AbEXadPnZjFs4Z")
-    d.listAll("root")
-    print(d.folderCount)
-    print(d.fileCount)
+    # folderCount, fileCount = d.listAll("1QHfx3xUyKMvzPxqrI1AbEXadPnZjFs4Z")
+    folderCount, fileCount = d.listAll("root")
+    print(folderCount)
+    print(fileCount)
+    
     front = time.time()
     print(front-back)
     

@@ -38,4 +38,12 @@ class RequestError:
         elif self.res != None and isinstance(self.res, apiErrors.BatchError):
 
             return RequestError.BATCH_ERROR
-            
+class DriveError(Exception):
+
+    INVALID_SYNC_FOLDER = "Invalid sync folder"
+    NO_PERMISSION = "No permission"
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._cause = args[0]
+    def getCause(self):
+        return self._cause
