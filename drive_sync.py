@@ -9,15 +9,16 @@ import watchdog.events as Events
 import asyncio
 import hashlib
 import concurrent.futures.thread
-
+import queue
 import datetime
 from pathlib import *
+from GDrive import DriveClient
+import signal
+from errors import DriveError
+import time
 
 
-IGNORE_FILES: set = {".hashsum", ".hashsum_old"}
 IGNORE_FOLDS: set = {".sync_ignore"}
-
-
 
 
 class FileEventHandler(FileSystemEventHandler):
@@ -45,8 +46,8 @@ class FileEventHandler(FileSystemEventHandler):
             elif(type(event) == Events.FileModifiedEvent):
                 # print("file modified")
                 file = Path(event.src_path)
-                if file.name in IGNORE_FILES:
-                    self.__modified_files__.add(file.parent)
+                
+                self.__modified_files__.add(file.parent)
 
         return super().on_modified(event)
 
@@ -58,117 +59,151 @@ class DriveSync:
     def __init__(self, folder):
         super().__init__()
         self.local_dir: str = folder
-        self.STORAGE_NAMES: list = ["test"]
-        self.GLOBAL_FLAGS: list = [
-        "--use-json-log", "--cache-dir", "{}/.cache".format(self.local_dir),
-        "--cache-chunk-path", "{}/.cache-chunk".format(self.local_dir),
-        "--cache-db-path", "{}/.cache-db".format(self.local_dir),
-        "--drive-chunk-size=64M", "-u", "--fast-list"
-        ]
-        self.BACKEND_FLAGS: list = [
-        "--recursive", "--drive-use-trash",
-         "--drive-acknowledge-abuse", "--exclude", "/.sync_ignore/**"
-        ]
-
+        self.cache_dir: str = ""
         self.file_event_handler = FileEventHandler()
+        self.searchFolderUnfinished: int = 0
         self.fileObserver = Observer()
         self.fileObserver.schedule(
             self.file_event_handler, folder, recursive=True)
         self.fileObserver.start()
+        self.searchFolderQueue: queue.Queue = queue.Queue(10000)
+        self.fileWriteQueue: queue.Queue = queue.Queue(1000)
+        self.folderWriteQueue: queue.Queue = queue.Queue(1000)
         self.threadpoolExecutor = concurrent.futures.thread.ThreadPoolExecutor(
             max_workers=8)
-        self.__is_hashing__ = False
-        self.__is_caching__ = False
+        self.__is_hashing__: bool = False
+        self.__is__checking__: bool = False
         self.__is_syncing__: bool = False
-
+        self.driveclient = DriveClient(self.cache_dir)
+        signal.signal(signal.SIGINT, self.__keyboardINT__)
+        signal.signal(signal.SIGTERM, self.__terminate__)
         atexit.register(self.__cleanup__)  # register cleanup
+
+    def __terminate__(self, signal, frame):
+        self.__cleanup__()
 
     def __cleanup__(self):
         self.fileObserver.stop()
         self.fileObserver.join()
         self.__is_hashing__ = False
-        self.__is_caching__ = False
-        self.threadpoolExecutor.shutdown()
+        self.__is__checking__ = False
+        self.threadpoolExecutor.shutdown(True)
 
-    def __check_install__(self):
+    def __keyboardINT__(self, signal, frame):
+        print("keyboard interrupt received")
+        self.__cleanup__()
 
-        try:
-            folder = Path(self.local_dir)
-            if not folder.joinpath(".cache").exists():
-                folder.joinpath(".cache").mkdir()
-            if not folder.joinpath(".cache-db").exists():
-                folder.joinpath(".cache-db").mkdir()
-            if not folder.joinpath(".cache-chunks").exists():
-                folder.joinpath(".cache-chunks").mkdir()
-            if not folder.joinpath(".logs").exists():
-                folder.joinpath(".logs").mkdir()
-        except FileExistsError as exi:
-            print(exi)
+    def __startup_check__(self):
+        
+        folder = Path(self.local_dir)
+        if not folder.exists() or not folder.is_dir():
+            raise DriveError(DriveError.INVALID_SYNC_FOLDER)           
+        if not os.access(self.local_dir, os.R_OK|os.W_OK|os.X_OK):
+            raise DriveError(DriveError.NO_PERMISSION)
 
-        call_result = subprocess.run(
-            ["rclone", *self.GLOBAL_FLAGS, "version"], capture_output=True, encoding="UTF-8")
-        self.match_version = re.search(
-            r"rclone v(?:.||\n)*- os/arch:(?:.||\n)*- go version", call_result.stdout)
-        # print("stdout", call_result.stdout)
-        # print("stderr", call_result.stderr)
+        IGN = Path(self.local_dir).joinpath(".sync_ignore")
 
-        # print(" ".join(["rclone", *self.GLOBAL_FLAGS, "version"]))
+        if not IGN.exists():
+            IGN.mkdir()
+        self.cache_dir = str(IGN.resolve())      
 
-        if self.match_version != None:
-            return 1
-        else:
-            return 0
+        
+    def writeToCache(self, q: queue.Queue, cache_file_name: str = "drive_cache"):
 
-    def generate_hashsum(self, path: Path):
+        first: bool = True
+        with Path(self.cache_dir).joinpath(cache_file_name).open(mode="w", encoding="UTF-8") as f:
+            f.write("[")
+            while self.__is_hashing__ == True:
+                if q.qsize() == 0:
+                    time.sleep(0.1)
+                else:
+                    t: str = q.get(block=True)
+                    if t == None:
+                        q.task_done()
+                        break
+                    else:
+                        if first:
+                            first = False
+                        else:
+                            f.write(",")
+                        f.write(t)
+                        q.task_done()
+            f.write("]")
+
+    def _searchFolder(self):
+
+        
+        sq = self.searchFolderQueue
+        while self.__is_hashing__:
+            files: list = list()
+            folders: list = list()
+            try:
+                path = sq.get(block=False)
+                for x in path.iterdir():
+                    if x.is_file():
+                        m = hashlib.md5()
+                        try:
+                            
+                            with x.open("rb") as f:
+                                for chunk in iter(lambda: f.read(4096), b""):
+                                    m.update(chunk)
+                        except IOError as e:
+                            print(e)
+                            pass
+                        h = m.hexdigest()   
+                        data: dict = dict()                     
+                        data["name"] = x.name
+                        data["md5Checksum"] = h
+                        data["path"] = str(x.parent)
+                        data["isDir"] = False
+                        data["modifiedTime"] = str(
+                            datetime.datetime.utcfromtimestamp(x.stat().st_mtime))   
+                        files.append(data)
+
+                    elif x.is_dir() and x.name not in IGNORE_FOLDS:
+                        data: dict = dict()
+                        data["name"] = x.name                        
+                        data["path"] = str(x.parent)
+                        data["isDir"] = True
+                        data["modifiedTime"] = str(
+                            datetime.datetime.utcfromtimestamp(x.stat().st_mtime))
+                        folders.append(data)
+                        sq.put(x, block=False)
+                        self.searchFolderUnfinished += 1
+                ri: str = json.dumps(files, ensure_ascii=False)[1:-1]
+                ro: str = json.dumps(folders, ensure_ascii=False)[1:-1]
+                if len(ri) > 0:
+                    self.fileWriteQueue.put(ri, block=False)
+                if len(ro) > 0:
+                    self.folderWriteQueue.put(ro, block=False)
+
+                  
+            except queue.Empty:
+                pass
+            except FileNotFoundError as e:
+                print(e)
+                sq.task_done()
+                self.searchFolderUnfinished -= 1
+            except Exception as e:
+                sq.task_done()
+                self.searchFolderUnfinished -= 1
+                raise
+            else:
+                sq.task_done()
+                self.searchFolderUnfinished -= 1
+
+    async def generate_hashsum(self, path: Path):
         '''Generates a checksum file in the ".sync_ignore" folder for the files below 
         "path"  '''
-
-        if not self.__is_hashing__:
-            return
-
-        files = list()
-        folders = list()
-        for x in path.iterdir():
-            if x.is_file():
-                files.append(x)
-            elif x.is_dir() and x.name not in IGNORE_FOLDS:
-                folders.append(x)
-                self.threadpoolExecutor.submit(self.generate_hashsum, x)
-
-        jj = dict()
-        jj["ModTime"] = str(datetime.datetime.now())
-        jj["Path"] = str(path.resolve())
-        jj["files"] = list()
-        for fs in files:
-            if(fs.name in IGNORE_FILES):
-                continue
-            m = hashlib.md5()
-            try:
-                with open(fs.resolve(), "rb") as f:
-                    for chunk in iter(lambda: f.read(4096), b""):
-                        m.update(chunk)
-            except IOError as e:
-                print(e)
-                pass
-            h = m.hexdigest()
-            data: dict = dict()
-            data["Name"] = fs.name
-            data["Hash"] = h
-            data["ModTime"] = str(
-                datetime.datetime.fromtimestamp(fs.stat().st_mtime))
-            jj["files"].append(data)
-            print(fs.name, h)
-
-        if len(jj["files"]) > 0:
-            
-            m = hashlib.md5(str(path.resolve()).encode("UTF-8"))
-            try:
-                with open(Path(self.local_dir).joinpath(".sync_ignore", 
-                    "hashsum_local", m.hexdigest()), "w") as f:
-                    json.dump(jj, f, ensure_ascii=False)
-            except IOError as e:
-                print("write local hashsum error")
-                print(e)
+        self.__is_hashing__ = True
+        self.__is__checking__ = True
+        self.searchFolderQueue.put(path, block=False)
+        self.searchFolderUnfinished += 1
+        self.threadpoolExecutor.submit(self.writeToCache, self.fileWriteQueue, "local_cache_files")
+        self.threadpoolExecutor.submit(self.writeToCache, self.folderWriteQueue, "local_cache_folders")
+        self.threadpoolExecutor.submit(self._searchFolder)
+        while self.searchFolderUnfinished > 0:
+            await asyncio.sleep(0.5)
 
     async def cache_remote(self, paths: list):
         '''Cache the remote hash of path "paths" on local directory 
@@ -180,7 +215,7 @@ class DriveSync:
 
         popen = subprocess.Popen(
             ["rclone", *self.GLOBAL_FLAGS, "lsjson", "--hash", "--recursive",
-            "{0}:/{1}".format("GsuiteDrive", "/".join(paths))],
+             "{0}:/{1}".format("GsuiteDrive", "/".join(paths))],
             encoding="UTF-8", stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE)
 
@@ -188,12 +223,12 @@ class DriveSync:
             print(popen.stdout.readline())
             await asyncio.sleep(1)
         print("write complete")
-        
-        if 1:    
+
+        if 1:
             k = Path(self.local_dir).joinpath(".sync_ignore", "cache.json")
             j: list = json.load(k.open("r"))
             files: list = list()
-            folders: list = list() 
+            folders: list = list()
             for i in j:
                 if i["IsDir"]:
                     folders.append(i["Name"])
@@ -202,7 +237,8 @@ class DriveSync:
 
             try:
 
-                syncIGP = Path(self.local_dir).joinpath(".sync_ignore", "hashsum_remote").resolve()
+                syncIGP = Path(self.local_dir).joinpath(
+                    ".sync_ignore", "hashsum_remote").resolve()
                 m = hashlib.md5(str(syncIGP.joinpath(*paths)).encode("UTF-8"))
                 with syncIGP.joinpath(m.hexdigest()).open(mode="w", encoding="UTF-8") as f:
                     json.dump(files, f, ensure_ascii=False)
@@ -219,41 +255,21 @@ class DriveSync:
 
     async def __check_changes__(self):
 
-        self.__is_hashing__ = True
-        self.__is_caching__ = True
-        # self.file_event_handler.togglestate(True)
-        # self.generate_hashsum(Path(self.local_dir))
-        # for i in self.file_event_handler.getModified():
-        #     print(i)
-        await self.cache_remote([])
-        
+        self.file_event_handler.togglestate(True)
+        while self.__is__checking__:            
+            
+            gen = asyncio.create_task(self.generate_hashsum(Path(self.local_dir)), name="generate_hashsum")
+            
+            for i in self.file_event_handler.getModified():
+                print(i)
+            # await self.cache_remote([])
+            await asyncio.sleep(6)
+            if gen.done():
+                break
         print("done")
-        await asyncio.sleep(6)
+        
 
-    def start(self):
-        '''This is the function to start syncing '''
-
-        if not self.__check_install__():
-            print("must install first")
-            exit(1)
-        root = Path(self.local_dir)
-        if not root.exists():
-            print("invalid destination folder")
-            exit(2)
-        ignore = root.joinpath(".sync_ignore")
-        ignore.mkdir(parents=False, exist_ok=True)
-        local = ignore.joinpath("hashsum_local")
-        remote = ignore.joinpath("hashsum_remote")
-        local.mkdir(parents=False, exist_ok=True)
-        remote.mkdir(parents=False, exist_ok=True)
-        while True:
-
-            try:
-                asyncio.run(self.__check_changes__())
-
-            except KeyboardInterrupt:
-                print("exit")
-                exit(0)
+    
 
     async def __sync__(self):
 
@@ -275,6 +291,14 @@ class DriveSync:
 
         self.__is_syncing__ = False
 
+    def start(self):
+        '''This is the function to start syncing '''
+
+        self.__startup_check__()
+        asyncio.run(self.__check_changes__())
+        
+    def stop(self):
+        self.__cleanup__()
 
 if __name__ == "__main__":
     r = DriveSync("/home/kie/test")
