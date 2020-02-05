@@ -61,6 +61,7 @@ class DriveSync:
         self.local_dir: str = folder
         self.cache_dir: str = ""
         self.file_event_handler = FileEventHandler()
+        self.searchFolderUnfinished: int = 0
         self.fileObserver = Observer()
         self.fileObserver.schedule(
             self.file_event_handler, folder, recursive=True)
@@ -71,7 +72,7 @@ class DriveSync:
         self.threadpoolExecutor = concurrent.futures.thread.ThreadPoolExecutor(
             max_workers=8)
         self.__is_hashing__: bool = False
-        self.__is_caching__: bool = False
+        self.__is__checking__: bool = False
         self.__is_syncing__: bool = False
         self.driveclient = DriveClient(self.cache_dir)
         signal.signal(signal.SIGINT, self.__keyboardINT__)
@@ -85,7 +86,7 @@ class DriveSync:
         self.fileObserver.stop()
         self.fileObserver.join()
         self.__is_hashing__ = False
-        self.__is_caching__ = False
+        self.__is__checking__ = False
         self.threadpoolExecutor.shutdown(True)
 
     def __keyboardINT__(self, signal, frame):
@@ -168,6 +169,7 @@ class DriveSync:
                             datetime.datetime.utcfromtimestamp(x.stat().st_mtime))
                         folders.append(data)
                         sq.put(x, block=False)
+                        self.searchFolderUnfinished += 1
                 ri: str = json.dumps(files, ensure_ascii=False)[1:-1]
                 ro: str = json.dumps(folders, ensure_ascii=False)[1:-1]
                 if len(ri) > 0:
@@ -181,23 +183,28 @@ class DriveSync:
             except FileNotFoundError as e:
                 print(e)
                 sq.task_done()
+                self.searchFolderUnfinished -= 1
             except Exception as e:
                 sq.task_done()
+                self.searchFolderUnfinished -= 1
                 raise
             else:
                 sq.task_done()
+                self.searchFolderUnfinished -= 1
 
-    def generate_hashsum(self, path: Path):
+    async def generate_hashsum(self, path: Path):
         '''Generates a checksum file in the ".sync_ignore" folder for the files below 
         "path"  '''
         self.__is_hashing__ = True
-        self.__is_caching__ = True
+        self.__is__checking__ = True
         self.searchFolderQueue.put(path, block=False)
+        self.searchFolderUnfinished += 1
         self.threadpoolExecutor.submit(self.writeToCache, self.fileWriteQueue, "local_cache_files")
         self.threadpoolExecutor.submit(self.writeToCache, self.folderWriteQueue, "local_cache_folders")
         self.threadpoolExecutor.submit(self._searchFolder)
-        self.searchFolderQueue.join()
-        
+        while self.searchFolderUnfinished > 0:
+            await asyncio.sleep(0.5)
+
     async def cache_remote(self, paths: list):
         '''Cache the remote hash of path "paths" on local directory 
 
@@ -248,14 +255,17 @@ class DriveSync:
 
     async def __check_changes__(self):
 
-        
         self.file_event_handler.togglestate(True)
-        
-        self.generate_hashsum(Path(self.local_dir))
-        for i in self.file_event_handler.getModified():
-            print(i)
-        # await self.cache_remote([])
-
+        while self.__is__checking__:            
+            
+            gen = asyncio.create_task(self.generate_hashsum(Path(self.local_dir)), name="generate_hashsum")
+            
+            for i in self.file_event_handler.getModified():
+                print(i)
+            # await self.cache_remote([])
+            await asyncio.sleep(6)
+            if gen.done():
+                break
         print("done")
         
 
