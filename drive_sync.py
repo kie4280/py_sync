@@ -8,7 +8,7 @@ from watchdog.events import FileSystemEventHandler
 import watchdog.events as Events
 import asyncio
 import hashlib
-import concurrent.futures.thread
+from threadExecutor import ThreadPoolExecutorStackTraced as ThreadPoolExecutor
 import queue
 import datetime
 from pathlib import *
@@ -69,8 +69,7 @@ class DriveSync:
         self.searchFolderQueue: queue.Queue = queue.Queue(10000)
         self.fileWriteQueue: queue.Queue = queue.Queue(1000)
         self.folderWriteQueue: queue.Queue = queue.Queue(1000)
-        self.threadpoolExecutor = concurrent.futures.thread.ThreadPoolExecutor(
-            max_workers=8)
+        self.threadpoolExecutor = ThreadPoolExecutor(max_workers=8)
         self.__is_hashing__: bool = False
         self.__is__checking__: bool = False
         self.__is_syncing__: bool = False

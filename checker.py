@@ -4,9 +4,9 @@ import pathlib
 path = "/home/kie/test/.sync_ignore"
 r = pathlib.Path(path)
 
-rclone = json.load(r.joinpath("remote_cache_files1").open("r"))
+rclone = json.load(r.joinpath("remote_cache_folders2").open("r"))
 
-my = json.load(r.joinpath("remote_cache_files").open("r"))
+my = json.load(r.joinpath("remote_cache_folders").open("r"))
 
 set1 = set()
 set2 = set()

@@ -26,6 +26,7 @@ import datetime
 import asyncio
 import codecs
 
+
 class DriveClient:
 
     SCOPES = ['https://www.googleapis.com/auth/drive.readonly',
@@ -33,6 +34,7 @@ class DriveClient:
               ]
 
     fields = "nextPageToken, files(id, name, md5Checksum, mimeType, parents, modifiedTime)"
+    max_threads = 16
 
     def __init__(self, cache_dir: str):
         super().__init__()
@@ -55,15 +57,15 @@ class DriveClient:
         self.unfinished_file_req: int = 0
         self.fileWriteQueue: queue.Queue = queue.Queue(1000)
         self.folderWriteQueue: queue.Queue = queue.Queue(1000)
-        self.folderQueries: queue.Queue = queue.Queue(10000)
-        self.fileQueries: queue.Queue = queue.Queue(10000)
+        self.folderQueries: queue.Queue = queue.Queue(100000)
+        self.fileQueries: queue.Queue = queue.Queue(100000)
         self.searchFolderQueue: queue.Queue = queue.Queue(10000)
         self.searchFileQueue: queue.Queue = queue.Queue(10000)
         self.folderPageTokens: dict = dict()
         self.filePageTokens: dict = dict()
 
         self.threadPoolExecutor = ThreadPoolExecutor(
-            max_workers=16)
+            max_workers=DriveClient.max_threads)
 
         self.threadnames: dict = dict()
         signal.signal(signal.SIGINT, self.__keyboardINT__)
@@ -123,31 +125,44 @@ class DriveClient:
 
                 try:
                     results: list = self.folderWriteQueue.get(block=False)
-                    
-
+                    for i in results:
+                        id = i["id"]
+                        parents: str = i["parents"][0]
+                        path: str = self.folderPaths.get(
+                            parents, "/") + i["name"] + "/"
+                        self.folderPaths[id] = path
+                        i["path"] = path
+                    self.folders.extend(results)
                     if first1:
                         first1 = False
                     else:
                         folderopen.write(",")
-                    t: str = json.dumps(results, ensure_ascii=False)[1:-1]
+                    t: str = json.dumps(
+                        results, ensure_ascii=False, separators=(",", ":"))[1:-1]
                     folderopen.write(t)
                 except queue.Empty:
                     pass
                 except Exception:
-                    self.folderwriteQueue.task_done()
+                    self.folderWriteQueue.task_done()
                     raise
                 else:
                     self.folderWriteQueue.task_done()
 
                 try:
                     results: list = self.fileWriteQueue.get(block=False)
-                    
+                    for i in results:
+                        id = i["id"]
+                        parents: str = i["parents"][0]
+                        path: str = self.folderPaths.get(parents, "/")
+                        self.folderPaths[id] = path
+                        i["path"] = path
                     self.files.extend(results)
                     if first2:
                         first2 = False
                     else:
                         fileopen.write(",")
-                    t: str = json.dumps(results, ensure_ascii=False)[1:-1]
+                    t: str = json.dumps(
+                        results, ensure_ascii=False, separators=(",", ":"))[1:-1]
                     fileopen.write(t)
                 except queue.Empty:
                     pass
@@ -156,7 +171,6 @@ class DriveClient:
                     raise
                 else:
                     self.fileWriteQueue.task_done()
-                
 
                 if self.folderWriteQueue.qsize() == 0 and self.fileWriteQueue.qsize() == 0:
                     time.sleep(0.5)
@@ -265,7 +279,10 @@ class DriveClient:
         retry: bool = False
         self.file_threads += 1
 
-        while self.terminate == False:
+        while self.terminate == False and \
+            (self.unfinished_file_req > 0 or self.unfinished_folder_req > 0
+             or self.fileQueries.qsize() > 0 or self.folderQueries.qsize() > 0
+             or self.searchFileQueue.qsize() > 0 or self.searchFolderQueue.qsize() > 0):
 
             sq_size = sq.qsize()
 
@@ -302,7 +319,7 @@ class DriveClient:
                     self.unfinished_file_req -= 1
                     sq.task_done()
                 else:
-                    
+
                     self.unfinished_file_req -= 1
                     sq.task_done()
                     raise
@@ -387,10 +404,12 @@ class DriveClient:
         fq = self.folderQueries
         service = self.getService()
         retry: bool = False
-        
+
         self.folder_threads += 1
 
-        while self.terminate == False:
+        while self.terminate == False and \
+            (self.unfinished_folder_req > 0 or self.searchFolderQueue.qsize() > 0 or
+             self.folderQueries.qsize() > 0):
 
             sq_size = sq.qsize()
 
@@ -427,7 +446,7 @@ class DriveClient:
                     self.unfinished_folder_req -= 1
                     sq.task_done()
                 else:
-                    
+
                     self.unfinished_folder_req -= 1
                     sq.task_done()
                     raise
@@ -469,35 +488,44 @@ class DriveClient:
         file_futures: list = list()
         for i in range(8):
             folder_futures.append(self.threadPoolExecutor.submit(
-                self._listFolders, folder=folder))
-        for i in range(8):
+                self._listFolders))
+        for i in range(7):
             file_futures.append(self.threadPoolExecutor.submit(
-                self._listFiles, folder=folder))
+                self._listFiles))
 
         while self.terminate == False and \
             (self.folderQueries.qsize() > 0 or self.searchFolderQueue.qsize() > 0
              or self.fileQueries.qsize() > 0 or self.searchFileQueue.qsize() > 0
              or self.unfinished_file_req > 0 or self.unfinished_folder_req > 0
              or self.fileWriteQueue.qsize() > 0 or self.folderWriteQueue.qsize() > 0):
-            try:
-                for i in folder_futures:
-                    if i.done():
-                        exc = i.exception(timeout=1)
-                        raise exc
-                for i in file_futures:
-                    if i.done():
-                        exc = i.exception(timeout=1)
-                        raise exc
-                if writeCacheFuture.done():
-                    exc  = writeCacheFuture.exception(timeout=1)
-                    raise exc
-            except Exception as e:
+            exceptions: list = list()
+
+            for i in folder_futures:
+                if i.done():
+                    exc = i.exception(timeout=1)
+                    if exc != None:
+                        exceptions.append(exc)
+                    if self.folder_threads + self.file_threads < DriveClient.max_threads - 1:
+                        file_futures.append(
+                            self.threadPoolExecutor.submit(self._listFiles))
+                    folder_futures.remove(i)
+
+            for i in file_futures:
+                if i.done():
+                    exc = i.exception(timeout=1)
+                    if exc != None:
+                        exceptions.append(exc)
+                    file_futures.remove(i)
+            if writeCacheFuture.done():
+                exc = writeCacheFuture.exception(timeout=1)
+                if exc != None:
+                    exceptions.append(exc)
+            for e in exceptions:
                 msg = e.args[0]
                 msg = str(codecs.decode(msg, "ascii"))
                 print(msg, end='')
             time.sleep(1)
 
-        
         self.terminate = True
         return self.folderCount, self.fileCount
 
