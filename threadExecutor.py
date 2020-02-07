@@ -18,4 +18,4 @@ class ThreadPoolExecutorStackTraced(ThreadPoolExecutor):
         try:
             return fn(*args, **kwargs)
         except Exception:
-            raise sys.exc_info()[0](traceback.format_exc().encode("ascii")) 
+            raise sys.exc_info()[0](traceback.format_exc().encode("UTF-8")) 

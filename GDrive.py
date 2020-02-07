@@ -44,9 +44,8 @@ class DriveClient:
         self.folder_threads: int = 0
         self.file_threads: int = 0
         self.folderScanSleepTime: int = 0.5
-        self.fileScanSleepTime: int = 0.5
-        self.folderScanComplete: bool = False
-        self.fileScanComplete: bool = False
+        self.fileScanSleepTime: int = 0.5        
+        self.dataValid: bool = False
         self.files: list = list()
         self.folders: list = list()
         self.folderPaths: dict() = dict()
@@ -63,7 +62,9 @@ class DriveClient:
         self.searchFileQueue: queue.Queue = queue.Queue(10000)
         self.folderPageTokens: dict = dict()
         self.filePageTokens: dict = dict()
-
+        self.__is_checking__: bool = False
+        self.fileCounter_lock: threading.Lock = threading.Lock()
+        self.folderCounter_lock: threading.Lock = threading.Lock()
         self.threadPoolExecutor = ThreadPoolExecutor(
             max_workers=DriveClient.max_threads)
 
@@ -76,6 +77,7 @@ class DriveClient:
         self.__cleanup__()
 
     def stop(self):
+        self.__is_checking__ = False
         self.__cleanup__()
 
     def __cleanup__(self):
@@ -129,10 +131,10 @@ class DriveClient:
                         id = i["id"]
                         parents: str = i["parents"][0]
                         path: str = self.folderPaths.get(
-                            parents, "/") + i["name"] + "/"
-                        self.folderPaths[id] = path
+                            parents, "/")
+                        self.folderPaths[id] = path + i["name"] + "/"
                         i["path"] = path
-                    self.folders.extend(results)
+                    # self.folders.extend(results)
                     if first1:
                         first1 = False
                     else:
@@ -154,9 +156,9 @@ class DriveClient:
                         id = i["id"]
                         parents: str = i["parents"][0]
                         path: str = self.folderPaths.get(parents, "/")
-                        self.folderPaths[id] = path
+                        
                         i["path"] = path
-                    self.files.extend(results)
+                    # self.files.extend(results)
                     if first2:
                         first2 = False
                     else:
@@ -231,8 +233,10 @@ class DriveClient:
 
             elif nextPage == None and id in self.filePageTokens:
                 self.filePageTokens.pop(id, "")
-
-            self.fileCount += len(results)
+            c = len(results)
+            self.fileCounter_lock.acquire(blocking=True)
+            self.fileCount += c
+            self.fileCounter_lock.release()
 
             for f in results:
                 modifiedTime: str = f["modifiedTime"]
@@ -241,7 +245,7 @@ class DriveClient:
                 f["modifiedTime"] = newTime
                 f["isDir"] = False
 
-            if len(results) > 0:
+            if c > 0:
                 self.fileWriteQueue.put(results, block=False)
 
     def _generateFileQuery(self):
@@ -338,7 +342,7 @@ class DriveClient:
             fq.task_done()
 
         self.file_threads -= 1
-        return self.files
+        
 
     def _generateFolderQuery(self):
 
@@ -387,14 +391,17 @@ class DriveClient:
                 folder: str = "'{}' in parents".format(f["id"])
                 self.folderQueries.put(folder, block=False)
                 self.fileQueries.put(folder, block=False)
-                self.folderCount += 1
+                
                 modifiedTime: str = f["modifiedTime"]
                 newTime: str = str(pyrfc3339.parse(modifiedTime)
                                    .replace(tzinfo=None))  # modified time is always in UTC
                 f["modifiedTime"] = newTime
                 f["isDir"] = True
-
-            if len(results) > 0:
+            c = len(results)
+            self.folderCounter_lock.acquire(blocking=True)
+            self.folderCount += c
+            self.folderCounter_lock.release()
+            if c > 0:
                 self.folderWriteQueue.put(results, block=False)
 
     def _listFolders(self, trashed: bool = False, **kwargs):
@@ -465,7 +472,7 @@ class DriveClient:
             fq.task_done()
 
         self.folder_threads -= 1
-        return self.folders
+        
 
     def listAll(self, folder: str = "root", trashed: bool = False, mimeType: str = "", **kwargs):
         '''Args: folder: search under this directory, trashed: show trashed \n
@@ -473,6 +480,7 @@ class DriveClient:
         '''
 
         self.terminate = False
+        self.dataValid = False
         writeCacheFuture = self.threadPoolExecutor.submit(self.writeToCache)
 
         folder_str: str = "'{0}' in parents".format(folder)
@@ -522,11 +530,13 @@ class DriveClient:
                     exceptions.append(exc)
             for e in exceptions:
                 msg = e.args[0]
-                msg = str(codecs.decode(msg, "ascii"))
+                msg = str(codecs.decode(msg, "UTF-8"))
                 print(msg, end='')
             time.sleep(1)
 
         self.terminate = True
+        self.dataValid = True
+
         return self.folderCount, self.fileCount
 
     def upload(self, file):
@@ -545,18 +555,11 @@ class DriveClient:
 
     def watchChanges(self):
         self.threadPoolExecutor.submit(self._startWatching)
-
+        self.__is_checking__ = True
     def _startWatching(self):
+        
         pass
-
-
-class FileStruct:
-    def __init__(self):
-        super().__init__()
-
-    def children(self):
-        pass
-
+    
 
 if __name__ == "__main__":
     back = time.time()

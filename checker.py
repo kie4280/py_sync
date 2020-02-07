@@ -4,18 +4,20 @@ import pathlib
 path = "/home/kie/test/.sync_ignore"
 r = pathlib.Path(path)
 
-rclone = json.load(r.joinpath("remote_cache_folders2").open("r"))
+rclone = json.load(r.joinpath("cache2.json").open("r"))
 
-my = json.load(r.joinpath("remote_cache_folders").open("r"))
-
+my1 = json.load(r.joinpath("remote_cache_folders").open("r"))
+my2 = json.load(r.joinpath("remote_cache_files").open("r"))
+my: list = list(my1)
+my.extend(my2)
 set1 = set()
 set2 = set()
 
 for i in rclone:
-    if i["id"] in set1:
+    if i["ID"] in set1:
         print("same 1")
     else:
-        set1.add(i["id"])
+        set1.add(i["ID"])
 for i in my:
     if i["id"] in set2:
         print("same 2")
@@ -32,6 +34,6 @@ if len(s1) > 0:
             print(i)
 if len(s2) > 0:
     for i in rclone:
-        if i["id"] in s2:
+        if i["ID"] in s2:
             print(i)
 print(len(rclone), len(my))

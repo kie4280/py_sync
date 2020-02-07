@@ -16,6 +16,7 @@ from GDrive import DriveClient
 import signal
 from errors import DriveError
 import time
+import codecs
 
 
 IGNORE_FOLDS: set = {".sync_ignore"}
@@ -27,27 +28,37 @@ class FileEventHandler(FileSystemEventHandler):
         super().__init__()
         self.monitoring = False
         self.__modified_files__: set = set()
+        self.__IGNFolders__: set = None
 
-    def getModified(self):
+    def getModified(self) -> set:
         return self.__modified_files__
 
     def clearModified(self):
         self.__modified_files__.clear()
 
-    def togglestate(self, monitor: bool = False):
+    def togglestate(self, monitor: bool):
         self.monitoring = monitor
-
+    def setIgnore(self, folders: set):
+        self.__IGNFolders__ = set(folders)
     def on_modified(self, event):
         if(self.monitoring):
             # print(event, event.src_path)
-            if(type(event) == Events.DirModifiedEvent):
+            match = False
+            fol = Path(event.src_path)
+            if self.__IGNFolders__ != None:
+                for f in self.__IGNFolders__:
+                    if fol.match(f+"/**"):
+                        match = True
+                        break
+            if(type(event) == Events.DirModifiedEvent and not match):
                 # print("dir modified")
-                self.__modified_files__.add(Path(event.src_path))
-            elif(type(event) == Events.FileModifiedEvent):
-                # print("file modified")
-                file = Path(event.src_path)
                 
-                self.__modified_files__.add(file.parent)
+                    self.__modified_files__.add(event.src_path)
+            elif(type(event) == Events.FileModifiedEvent and not match):
+                # print("file modified")
+                
+
+                self.__modified_files__.add(event.src_path)
 
         return super().on_modified(event)
 
@@ -67,8 +78,10 @@ class DriveSync:
             self.file_event_handler, folder, recursive=True)
         self.fileObserver.start()
         self.searchFolderQueue: queue.Queue = queue.Queue(10000)
-        self.fileWriteQueue: queue.Queue = queue.Queue(1000)
-        self.folderWriteQueue: queue.Queue = queue.Queue(1000)
+        self.fileWriteQueue: queue.Queue = queue.Queue(10000)
+        self.folderWriteQueue: queue.Queue = queue.Queue(10000)
+        self.folders: list = list()
+        self.files: list = list()
         self.threadpoolExecutor = ThreadPoolExecutor(max_workers=8)
         self.__is_hashing__: bool = False
         self.__is__checking__: bool = False
@@ -93,45 +106,88 @@ class DriveSync:
         self.__cleanup__()
 
     def __startup_check__(self):
-        
+
         folder = Path(self.local_dir)
         if not folder.exists() or not folder.is_dir():
-            raise DriveError(DriveError.INVALID_SYNC_FOLDER)           
-        if not os.access(self.local_dir, os.R_OK|os.W_OK|os.X_OK):
+            raise DriveError(DriveError.INVALID_SYNC_FOLDER)
+        if not os.access(self.local_dir, os.R_OK | os.W_OK | os.X_OK):
             raise DriveError(DriveError.NO_PERMISSION)
 
         IGN = Path(self.local_dir).joinpath(".sync_ignore")
 
         if not IGN.exists():
             IGN.mkdir()
-        self.cache_dir = str(IGN.resolve())      
+        self.cache_dir = str(IGN.resolve())
+        self.file_event_handler.setIgnore({self.cache_dir})
 
-        
-    def writeToCache(self, q: queue.Queue, cache_file_name: str = "drive_cache"):
+    def writeToCache(self):
 
-        first: bool = True
-        with Path(self.cache_dir).joinpath(cache_file_name).open(mode="w", encoding="UTF-8") as f:
-            f.write("[")
+        first1: bool = True
+        first2: bool = True
+
+        try:
+
+            fileopen = Path(self.cache_dir).joinpath(
+                "local_cache_files").open(mode="w", encoding="UTF-8")
+            folderopen = Path(self.cache_dir).joinpath(
+                "local_cache_folders").open(mode="w", encoding="UTF-8")
+
+            fileopen.write("[")
+            folderopen.write("[")
             while self.__is_hashing__ == True:
-                if q.qsize() == 0:
-                    time.sleep(0.1)
-                else:
-                    t: str = q.get(block=True)
-                    if t == None:
-                        q.task_done()
-                        break
+
+                try:
+                    results: list = self.folderWriteQueue.get(block=False)
+                    
+                    
+                    if first1:
+                        first1 = False
                     else:
-                        if first:
-                            first = False
-                        else:
-                            f.write(",")
-                        f.write(t)
-                        q.task_done()
-            f.write("]")
+                        folderopen.write(",")
+                    
+                    folderopen.write(results)
+                except queue.Empty:
+                    pass
+                except Exception:
+                    self.folderWriteQueue.task_done()
+                    raise
+                else:
+                    self.folderWriteQueue.task_done()
+
+                try:
+                    results: list = self.fileWriteQueue.get(block=False)
+                    
+                    
+                    if first2:
+                        first2 = False
+                    else:
+                        fileopen.write(",")
+                    
+                    fileopen.write(results)
+                except queue.Empty:
+                    pass
+                except Exception:
+                    self.fileWriteQueue.task_done()
+                    raise
+                else:
+                    self.fileWriteQueue.task_done()
+
+                if self.folderWriteQueue.qsize() == 0 and self.fileWriteQueue.qsize() == 0:
+                    time.sleep(0.5)
+
+            fileopen.write("]")
+            folderopen.write("]")
+        except IOError as e:
+
+            raise
+        except OSError as o:
+            raise
+        finally:
+            fileopen.close()
+            folderopen.close()
 
     def _searchFolder(self):
 
-        
         sq = self.searchFolderQueue
         while self.__is_hashing__:
             files: list = list()
@@ -142,26 +198,25 @@ class DriveSync:
                     if x.is_file():
                         m = hashlib.md5()
                         try:
-                            
                             with x.open("rb") as f:
                                 for chunk in iter(lambda: f.read(4096), b""):
                                     m.update(chunk)
                         except IOError as e:
                             print(e)
                             pass
-                        h = m.hexdigest()   
-                        data: dict = dict()                     
+                        h = m.hexdigest()
+                        data: dict = dict()
                         data["name"] = x.name
                         data["md5Checksum"] = h
                         data["path"] = str(x.parent)
                         data["isDir"] = False
                         data["modifiedTime"] = str(
-                            datetime.datetime.utcfromtimestamp(x.stat().st_mtime))   
+                            datetime.datetime.utcfromtimestamp(x.stat().st_mtime))
                         files.append(data)
 
                     elif x.is_dir() and x.name not in IGNORE_FOLDS:
                         data: dict = dict()
-                        data["name"] = x.name                        
+                        data["name"] = x.name
                         data["path"] = str(x.parent)
                         data["isDir"] = True
                         data["modifiedTime"] = str(
@@ -169,20 +224,21 @@ class DriveSync:
                         folders.append(data)
                         sq.put(x, block=False)
                         self.searchFolderUnfinished += 1
-                ri: str = json.dumps(files, ensure_ascii=False)[1:-1]
-                ro: str = json.dumps(folders, ensure_ascii=False)[1:-1]
+                self.folders.extend(folders)
+                self.files.extend(files)
+                ri: str = json.dumps(files, ensure_ascii=False, separators=(",",":"))[1:-1]
+                ro: str = json.dumps(folders, ensure_ascii=False, separators=(",",":"))[1:-1]
                 if len(ri) > 0:
                     self.fileWriteQueue.put(ri, block=False)
                 if len(ro) > 0:
                     self.folderWriteQueue.put(ro, block=False)
 
-                  
             except queue.Empty:
                 pass
-            except FileNotFoundError as e:
-                print(e)
+            except FileNotFoundError as e:                
                 sq.task_done()
                 self.searchFolderUnfinished -= 1
+                raise
             except Exception as e:
                 sq.task_done()
                 self.searchFolderUnfinished -= 1
@@ -190,7 +246,10 @@ class DriveSync:
             else:
                 sq.task_done()
                 self.searchFolderUnfinished -= 1
-
+            if self.fileWriteQueue.qsize() > 8000 or self.folderWriteQueue.qsize() > 8000:
+                time.sleep(1)
+            else:
+                time.sleep(0.005)
     async def generate_hashsum(self, path: Path):
         '''Generates a checksum file in the ".sync_ignore" folder for the files below 
         "path"  '''
@@ -198,10 +257,25 @@ class DriveSync:
         self.__is__checking__ = True
         self.searchFolderQueue.put(path, block=False)
         self.searchFolderUnfinished += 1
-        self.threadpoolExecutor.submit(self.writeToCache, self.fileWriteQueue, "local_cache_files")
-        self.threadpoolExecutor.submit(self.writeToCache, self.folderWriteQueue, "local_cache_folders")
-        self.threadpoolExecutor.submit(self._searchFolder)
-        while self.searchFolderUnfinished > 0:
+
+        futures: list = list()
+        exceptions: list = list()
+        futures.append(self.threadpoolExecutor.submit(self.writeToCache))
+        futures.append(self.threadpoolExecutor.submit(self._searchFolder))
+
+        while self.__is_hashing__ and \
+            (self.searchFolderUnfinished > 0 or self.searchFolderQueue.qsize() > 0
+             or self.fileWriteQueue.qsize() > 0 or self.folderWriteQueue.qsize() > 0):
+            for f in futures:
+                if f.done():
+                    exc = f.exception(timeout=1)
+                    if exc != None:
+                        exceptions.append(exc)
+                    futures.remove(f)
+            for e in exceptions:
+                msg = e.args[0]
+                msg = str(codecs.decode(msg, "UTF-8"))
+                print(msg, end='')
             await asyncio.sleep(0.5)
 
     async def cache_remote(self, paths: list):
@@ -255,20 +329,18 @@ class DriveSync:
     async def __check_changes__(self):
 
         self.file_event_handler.togglestate(True)
-        while self.__is__checking__:            
-            
-            gen = asyncio.create_task(self.generate_hashsum(Path(self.local_dir)), name="generate_hashsum")
-            
+        self.__is__checking__ = True
+        gen = asyncio.create_task(self.generate_hashsum(
+            Path(self.local_dir)), name="generate_hashsum")
+
+        while self.__is__checking__ and gen.done() == False:
+
             for i in self.file_event_handler.getModified():
                 print(i)
             # await self.cache_remote([])
-            await asyncio.sleep(6)
-            if gen.done():
-                break
+            await asyncio.sleep(1)
+            
         print("done")
-        
-
-    
 
     async def __sync__(self):
 
@@ -294,10 +366,12 @@ class DriveSync:
         '''This is the function to start syncing '''
 
         self.__startup_check__()
+        # self.__is__checking__ = True
         asyncio.run(self.__check_changes__())
-        
+
     def stop(self):
         self.__cleanup__()
+
 
 if __name__ == "__main__":
     r = DriveSync("/home/kie/test")
